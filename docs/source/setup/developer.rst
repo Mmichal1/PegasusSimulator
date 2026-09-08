@@ -16,6 +16,14 @@ run the following script provided with the framework:
 
     ./link_app.sh --path $ISAACSIM_PATH
 
+After linking Isaac Sim, regenerate editor import paths (VS Code / Cursor / basedpyright) with:
+
+.. code:: bash
+
+    python3 tools/generate_vscode_settings.py
+
+Then reload the editor window and select the interpreter at ``app/kit/python/bin/python3``.
+
 This script will create a symbolic link to ``ISAACSIM`` inside the repository. After this step, you can also launch the 
 ``ISAACSIM`` with the extension enabled (without using the GUI presented in Section :ref:`Installing the Pegasus Simulator`), by running:
 

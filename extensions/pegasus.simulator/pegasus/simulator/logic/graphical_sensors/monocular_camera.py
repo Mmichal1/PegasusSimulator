@@ -67,9 +67,10 @@ class MonocularCamera(GraphicalSensor):
         if self._intrinsics is not None:
             # Set the camera intrinsics
             ((self.fx,_,self.cx),(_,self.fy,self.cy),(_,_,_)) = self._intrinsics
+            self.fov = float(config.get("fov", 70.0))
         else:
-            # Assume a default field of view of 70 degrees
-            self.fov = 70.0  # degrees
+            # Assume a default field of view of 70 degrees unless overridden in config
+            self.fov = float(config.get("fov", 70.0))
             self.fx = 0.5 * self._resolution[0] / np.tan(0.5 * np.radians(self.fov))
             self.fy = self.fx
             self.cx = 0.5 * self._resolution[0]

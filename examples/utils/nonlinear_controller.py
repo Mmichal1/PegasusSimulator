@@ -97,6 +97,13 @@ class NonlinearController(Backend):
         self.atittude_error_over_time = []
         self.attitude_rate_error_over_time = []
 
+    def reset_episode(self) -> None:
+        """Reset controller state between simulation episodes."""
+        self.reset_statistics()
+        self.int = np.array([0.0, 0.0, 0.0])
+        self.reveived_first_state = False
+        self.input_ref = [0.0, 0.0, 0.0, 0.0]
+
     def read_trajectory_from_csv(self, file_name: str):
         """Auxiliar method used to read the desired trajectory from a CSV file
 
