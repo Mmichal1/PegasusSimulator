@@ -55,7 +55,7 @@ TARGET_AXIS = np.array([0.0, 1.0, 0.0])            # target crosses left/right (
 TARGET_AMPLITUDE = 50.0                            # metres each side of centre (30 m sweep, ~60 m per cycle)
 TARGET_ANGULAR_VELOCITY = 0.1                     # rad/s; peak speed ~ A * omega = 2.7 m/s (< PURSUER_SPEED)
 
-PURSUER_SPEED = 8.5                                # commanded closing speed [m/s]
+PURSUER_SPEED = 6.5                                # commanded closing speed [m/s]
 LEAD_ENABLED = True                                # False -> naive pure pursuit
 STARTUP_DELAY_S = 5.0
 
@@ -147,6 +147,11 @@ class PegasusApp:
             speed_ramp_time_s=3.0,       # ease 0 -> full speed over 3 s after acquiring
             velocity_time_constant_s=0.6,  # low-pass on commanded velocity
             alignment_min=0.2,           # mostly rotate-to-face before accelerating
+            # Vertical channel: keep climb gentle, allow quicker descent, so it doesn't
+            # balloon above the target and then overshoot on the way back down.
+            climb_rate_gain=1.2,
+            max_climb_rate=1.5,
+            max_descent_rate=2.5,
             coast_time_s=5.0,            # keep flying the last trajectory when detection drops
             startup_delay=STARTUP_DELAY_S,
             image_size=CAMERA_CONFIG["resolution"],

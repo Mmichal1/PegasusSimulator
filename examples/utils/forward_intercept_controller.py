@@ -108,6 +108,10 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         speed_ramp_time_s: float = 2.5,          # ramp 0 -> pursuer_speed after (re)acquiring
         velocity_time_constant_s: float = 0.5,   # low-pass on the commanded velocity vector
         alignment_min: float = 0.25,             # min speed fraction while still turning to face target
+        # --- vertical channel (decoupled from the horizontal chase) ---
+        climb_rate_gain: float = 1.0,            # P gain (1/s) mapping altitude error -> vertical speed
+        max_climb_rate: float = 1.5,             # m/s cap on climb (kept low to avoid ballooning up)
+        max_descent_rate: float = 2.5,           # m/s cap on descent (higher so it can shed altitude)
         **kwargs: Any,
     ):
         if not callable(getattr(detector, "detect", None)):
@@ -129,6 +133,9 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self.speed_ramp_time_s = float(speed_ramp_time_s)
         self.velocity_time_constant_s = float(velocity_time_constant_s)
         self.alignment_min = float(alignment_min)
+        self.climb_rate_gain = float(climb_rate_gain)
+        self.max_climb_rate = float(max_climb_rate)
+        self.max_descent_rate = float(max_descent_rate)
 
         self._estimator = TargetWorldEstimator(
             image_width=self.image_width,
@@ -404,8 +411,21 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         alignment = float(np.clip(np.cos(yaw_error), self.alignment_min, 1.0))
         speed = self.pursuer_speed * self._speed_ramp() * alignment
 
-        v_target = direction * speed
-        v_ref = self._smooth_velocity_ref(dt, v_target)
+        # Decouple the vertical channel from the horizontal chase. Spending the full speed
+        # budget along the 3D line-of-sight makes the pursuer balloon upward toward a higher
+        # target and then overshoot, because a multirotor climbs far more readily than it can
+        # descend. Instead chase in the horizontal plane at `speed` (low-pass filtered for a
+        # smooth camera), and close the altitude gap with a rate-limited proportional term
+        # (prompt, no momentum) that allows a faster descent than climb.
+        horizontal = np.array([direction[0], direction[1], 0.0])
+        h_norm = float(np.linalg.norm(horizontal))
+        v_xy = (horizontal / h_norm) * speed if h_norm > 1e-6 else np.zeros(3)
+        v_ref = self._smooth_velocity_ref(dt, v_xy)
+
+        alt_error = float(aim_point[2] - self.p[2])
+        v_ref[2] = float(
+            np.clip(self.climb_rate_gain * alt_error, -self.max_descent_rate, self.max_climb_rate)
+        )
 
         p_ref = self.p + v_ref * dt
         p_ref[2] = float(np.clip(p_ref[2], self.min_altitude, self.max_altitude))
