@@ -25,7 +25,12 @@ import carb
 import numpy as np
 
 from torpedo_controller_pluggable import PluggableTorpedoVisionController
-from world_intercept import IRIS_DRONE_WIDTH_M, TargetWorldEstimator, solve_intercept
+from world_intercept import (
+    CAMERA_TO_BODY,
+    IRIS_DRONE_WIDTH_M,
+    TargetWorldEstimator,
+    solve_intercept_iterative,
+)
 
 try:
     from camera_preview import import_cv2
@@ -48,7 +53,18 @@ def _draw_intercept_overlay(
     time_to_intercept_s: float | None,
     lead_enabled: bool,
     status: str,
+    trajectory_points: list[PixelCoord] | None = None,
+    aim_point_image: PixelCoord | None = None,
+    coasting: bool = False,
 ) -> RgbImage:
+    """
+    Annotate a *copy* of the camera frame for the preview window only.
+
+    NOTE: This is drawn on the preview image, never on the frame fed to the detector,
+    so the overlay can never leak back into detection. The predicted trajectory and
+    intercept point are the controller's world-frame estimates projected back into the
+    image (see ForwardInterceptController._project_world_to_image).
+    """
     if import_cv2 is None:
         return rgb
 
@@ -64,6 +80,18 @@ def _draw_intercept_overlay(
     h, w = bgr.shape[:2]
     cx, cy = w // 2, h // 2
     cv2.drawMarker(bgr, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 24, 2)
+
+    # Predicted target trajectory (amber while coasting, green while detected). BGR colours.
+    traj_color = (0, 165, 255) if coasting else (0, 255, 0)
+    if trajectory_points and len(trajectory_points) >= 2:
+        pts = np.array(trajectory_points, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(bgr, [pts], False, traj_color, 2, cv2.LINE_AA)
+
+    # Intercept / aim point (magenta).
+    if aim_point_image is not None:
+        au, av = int(aim_point_image[0]), int(aim_point_image[1])
+        cv2.drawMarker(bgr, (au, av), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
+        cv2.circle(bgr, (au, av), 9, (255, 0, 255), 2)
 
     if centroid is not None:
         u, v = int(centroid[0]), int(centroid[1])
@@ -97,11 +125,18 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         fov_deg: float = 70.0,
         position_smoothing: float = 0.35,
         velocity_smoothing: float = 0.2,
+        acceleration_smoothing: float = 0.15,
         min_bbox_width_px: float = 6.0,
         max_intercept_time_s: float = 12.0,
         min_altitude: float = 0.6,
         max_altitude: float = 10.0,
         lead_enabled: bool = True,
+        coast_time_s: float = 2.5,               # keep pursuing last trajectory this long after a detection drop
+        # --- trajectory prediction model ---
+        use_acceleration: bool = True,           # anticipate slow-downs / reversals (constant-accel model)
+        prediction_iterations: int = 4,          # fixed-point iterations for the intercept solve
+        accel_time_cap_s: float = 2.5,           # horizon over which the accel term is trusted
+        max_target_accel_mps2: float = 15.0,     # clamp on the estimated target acceleration
         # --- smoothness / camera-stability shaping ---
         max_yaw_rate: float = 1.2,               # rad/s cap on how fast the camera pans
         speed_ramp_time_s: float = 2.5,          # ramp 0 -> pursuer_speed after (re)acquiring
@@ -127,6 +162,11 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self.speed_ramp_time_s = float(speed_ramp_time_s)
         self.velocity_time_constant_s = float(velocity_time_constant_s)
         self.alignment_min = float(alignment_min)
+        self.coast_time_s = float(coast_time_s)
+
+        self.use_acceleration = bool(use_acceleration)
+        self.prediction_iterations = int(prediction_iterations)
+        self.accel_time_cap_s = float(accel_time_cap_s)
 
         self._estimator = TargetWorldEstimator(
             image_width=self.image_width,
@@ -135,12 +175,15 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
             target_width_m=target_width_m,
             position_smoothing=position_smoothing,
             velocity_smoothing=velocity_smoothing,
+            acceleration_smoothing=acceleration_smoothing,
             min_bbox_width_px=min_bbox_width_px,
+            max_acceleration_mps2=max_target_accel_mps2,
         )
 
         # Latest world-frame estimate / intercept solution (consumed by _vision_references).
         self._target_position: np.ndarray | None = None
         self._target_velocity: np.ndarray | None = None
+        self._target_acceleration: np.ndarray | None = None
         self._distance_m: float | None = None
         self._aim_point: np.ndarray | None = None
         self._time_to_intercept: float | None = None
@@ -148,6 +191,21 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         # Command-shaping state.
         self._filtered_velocity_ref: np.ndarray | None = None
         self._pursuit_start_time: float | None = None
+
+        # Last-known target memory (for coasting through detection dropouts).
+        self._last_target_position: np.ndarray | None = None
+        self._last_target_velocity: np.ndarray | None = None
+        self._last_target_acceleration: np.ndarray | None = None
+        self._last_seen_time: float | None = None
+
+        # Snapshot of what the controller is actually steering toward, for visualization.
+        self._viz_target_position: np.ndarray | None = None
+        self._viz_target_velocity: np.ndarray | None = None
+        self._viz_target_acceleration: np.ndarray | None = None
+        self._viz_aim_point: np.ndarray | None = None
+        self._viz_time_to_intercept: float | None = None
+        self._viz_coasting: bool = False
+        self._viz_active: bool = False
 
     def reset_episode(self) -> None:
         super().reset_episode()
@@ -157,12 +215,102 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self._distance_m = None
         self._aim_point = None
         self._time_to_intercept = None
+        self._target_acceleration = None
         self._filtered_velocity_ref = None
         self._pursuit_start_time = None
+        self._last_target_position = None
+        self._last_target_velocity = None
+        self._last_target_acceleration = None
+        self._last_seen_time = None
+        self._viz_target_position = None
+        self._viz_target_velocity = None
+        self._viz_target_acceleration = None
+        self._viz_aim_point = None
+        self._viz_time_to_intercept = None
+        self._viz_coasting = False
+        self._viz_active = False
+
+    def get_visualization_state(self) -> dict:
+        """State describing the trajectory the pursuer is steering toward (for debug draw)."""
+        return {
+            "active": self._viz_active,
+            "coasting": self._viz_coasting,
+            "pursuer": self.p.copy() if self.reveived_first_state else None,
+            "target": None if self._viz_target_position is None else self._viz_target_position.copy(),
+            "velocity": None if self._viz_target_velocity is None else self._viz_target_velocity.copy(),
+            "aim": None if self._viz_aim_point is None else self._viz_aim_point.copy(),
+            "time_to_intercept": self._viz_time_to_intercept,
+        }
 
     def _pursuer_yaw(self) -> float:
         forward = self.R.as_matrix()[:, 0]
         return float(np.arctan2(forward[1], forward[0]))
+
+    def _project_world_to_image(self, world_point: np.ndarray) -> PixelCoord | None:
+        """
+        Project a world point into the pursuer camera image using the full attitude.
+
+        Exact inverse of TargetWorldEstimator's bearing model, so a projected target
+        position lands back on its detection regardless of the drone's pitch/roll.
+        Returns None if the point is behind the camera or projects far outside the frame.
+        """
+        if not self.reveived_first_state:
+            return None
+
+        fx = self._estimator.fx
+        R = self.R.as_matrix()
+        camera_position = self.p + R @ self._estimator.camera_offset_body
+
+        rel = np.asarray(world_point, dtype=float) - camera_position
+        # World -> body -> camera frame (CAMERA_TO_BODY is orthonormal, so inverse = transpose).
+        dir_camera = CAMERA_TO_BODY.T @ (R.T @ rel)
+        forward_comp = float(dir_camera[2])
+        if forward_comp <= 1e-3:
+            return None
+
+        x_off = float(dir_camera[0]) / forward_comp
+        y_off = float(dir_camera[1]) / forward_comp
+        u = 0.5 * self.image_width + fx * x_off
+        v = 0.5 * self.image_height + fx * y_off
+
+        # Reject points that project absurdly far off-screen (keeps polylines sane).
+        if not (-4 * self.image_width < u < 4 * self.image_width):
+            return None
+        if not (-4 * self.image_height < v < 4 * self.image_height):
+            return None
+        return (int(round(u)), int(round(v)))
+
+    def _projected_trajectory_and_aim(self) -> tuple[list[PixelCoord], PixelCoord | None]:
+        """Project the current predicted target trajectory + aim point into image space."""
+        if not self._viz_active or self._viz_target_position is None:
+            return [], None
+
+        velocity = (
+            self._viz_target_velocity
+            if self._viz_target_velocity is not None
+            else np.zeros(3)
+        )
+        acceleration = (
+            self._viz_target_acceleration
+            if self._viz_target_acceleration is not None
+            else np.zeros(3)
+        )
+        horizon = max(3.0, float(self._viz_time_to_intercept) if self._viz_time_to_intercept else 0.0)
+
+        trajectory: list[PixelCoord] = []
+        for t in np.linspace(0.0, horizon, 16):
+            te = min(t, self.accel_time_cap_s)
+            future = self._viz_target_position + velocity * t + 0.5 * acceleration * te * te
+            projected = self._project_world_to_image(future)
+            if projected is not None:
+                trajectory.append(projected)
+
+        aim_image = (
+            self._project_world_to_image(self._viz_aim_point)
+            if self._viz_aim_point is not None
+            else None
+        )
+        return trajectory, aim_image
 
     @staticmethod
     def _wrap_to_pi(angle: float) -> float:
@@ -227,7 +375,7 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
                 estimate = self._estimator.update(
                     self._sim_time,
                     self.p,
-                    self._pursuer_yaw(),
+                    self.R.as_matrix(),
                     detection.centroid,
                     detection.bbox_width_px,
                 )
@@ -235,23 +383,28 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
             if estimate is not None:
                 self._target_position = estimate.position
                 self._target_velocity = estimate.velocity
+                self._target_acceleration = estimate.acceleration
                 self._distance_m = estimate.distance_m
 
                 aim_point, tti = (None, None)
                 if self.lead_enabled and estimate.velocity_valid:
-                    aim_point, tti = solve_intercept(
-                        self.p,
-                        self.pursuer_speed,
-                        estimate.position,
-                        estimate.velocity,
-                        max_time_s=self.max_intercept_time_s,
+                    aim_point, tti = self._solve_intercept(
+                        estimate.position, estimate.velocity, estimate.acceleration
                     )
                 self._aim_point = aim_point
                 self._time_to_intercept = tti
+
+                # Remember the last good fix so we can coast through detection dropouts.
+                self._last_target_position = estimate.position.copy()
+                self._last_target_velocity = estimate.velocity.copy()
+                self._last_target_acceleration = estimate.acceleration.copy()
+                self._last_seen_time = self._sim_time
             else:
+                # No usable detection this frame: keep the last-known target/trajectory so
+                # _vision_references can dead-reckon it (coast) instead of stopping.
                 self._target_position = None
                 self._target_velocity = None
-                self._distance_m = None
+                self._target_acceleration = None
                 self._aim_point = None
                 self._time_to_intercept = None
 
@@ -262,18 +415,22 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
                     if debug_image is None:
                         debug_image = rgb
                     target_speed = (
-                        float(np.linalg.norm(self._target_velocity))
-                        if self._target_velocity is not None
+                        float(np.linalg.norm(self._viz_target_velocity))
+                        if self._viz_target_velocity is not None
                         else None
                     )
+                    trajectory_points, aim_image = self._projected_trajectory_and_aim()
                     debug_image = _draw_intercept_overlay(
                         debug_image,
                         detection.centroid,
                         self._distance_m,
                         target_speed,
-                        self._time_to_intercept,
+                        self._viz_time_to_intercept,
                         self.lead_enabled,
                         self._last_status,
+                        trajectory_points=trajectory_points,
+                        aim_point_image=aim_image,
+                        coasting=self._viz_coasting,
                     )
                     self._camera_preview.update(debug_image)
         except Exception as exc:
@@ -309,24 +466,90 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         fraction = np.clip((self._sim_time - self._pursuit_start_time) / self.speed_ramp_time_s, 0.0, 1.0)
         return float(fraction * fraction * (3.0 - 2.0 * fraction))
 
+    def _solve_intercept(
+        self,
+        target_position: np.ndarray,
+        target_velocity: np.ndarray,
+        target_acceleration: np.ndarray | None,
+    ) -> tuple[np.ndarray | None, float | None]:
+        """Iterative constant-acceleration intercept using the configured prediction model."""
+        acceleration = target_acceleration if self.use_acceleration else None
+        return solve_intercept_iterative(
+            self.p,
+            self.pursuer_speed,
+            target_position,
+            target_velocity,
+            acceleration,
+            max_time_s=self.max_intercept_time_s,
+            iterations=self.prediction_iterations,
+            accel_time_cap_s=self.accel_time_cap_s,
+        )
+
+    def _resolve_target(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, bool]:
+        """
+        Decide what target position/velocity/acceleration to steer toward this frame.
+
+        Returns (position, velocity, acceleration, coasting), or (None, None, None, False)
+        when there is neither a fresh detection nor a recent enough last-known fix to coast.
+        """
+        zeros = np.zeros(3)
+
+        # Fresh detection this frame -> use it directly.
+        if self._has_detection and self._target_position is not None:
+            velocity = self._target_velocity if self._target_velocity is not None else zeros
+            acceleration = self._target_acceleration if self._target_acceleration is not None else zeros
+            return self._target_position, velocity, acceleration, False
+
+        # No detection: dead-reckon the last-known trajectory for up to coast_time_s, using
+        # the last acceleration so a turn in progress keeps curving instead of going straight.
+        if (
+            self._last_target_position is not None
+            and self._last_seen_time is not None
+            and (self._sim_time - self._last_seen_time) <= self.coast_time_s
+        ):
+            velocity = self._last_target_velocity if self._last_target_velocity is not None else zeros
+            acceleration = (
+                self._last_target_acceleration
+                if (self._last_target_acceleration is not None and self.use_acceleration)
+                else zeros
+            )
+            elapsed = self._sim_time - self._last_seen_time
+            te = min(elapsed, self.accel_time_cap_s)
+            predicted_position = self._last_target_position + velocity * elapsed + 0.5 * acceleration * te * te
+            predicted_velocity = velocity + acceleration * te
+            return predicted_position, predicted_velocity, acceleration, True
+
+        return None, None, None, False
+
     def _vision_references(
         self, dt: float
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
         if self._yaw_ref is None:
             self._init_yaw_reference()
 
-        if not self._has_detection or self._target_position is None:
+        target_position, target_velocity, target_acceleration, coasting = self._resolve_target()
+        if target_position is None:
+            self._viz_active = False
+            self._viz_coasting = False
             return self._search_references(dt)
 
-        target_position = self._target_position
+        # Choose the point to fly toward: the constant-acceleration intercept lead point
+        # when available, otherwise the target's (predicted) current position (pure pursuit).
+        aim_point, tti = (None, None)
+        if self.lead_enabled:
+            aim_point, tti = self._solve_intercept(
+                target_position, target_velocity, target_acceleration
+            )
+        if aim_point is None:
+            aim_point = target_position
 
-        # Choose the point to fly toward: the intercept lead point when available,
-        # otherwise fall back to the target's current position (pure pursuit).
-        if self.lead_enabled and self._aim_point is not None:
-            aim_point = self._aim_point
+        if coasting:
+            self._last_status = "coasting"
+        elif self.lead_enabled and tti is not None:
             self._last_status = "intercepting"
         else:
-            aim_point = target_position
             self._last_status = "pursuing"
 
         to_aim = aim_point - self.p
@@ -336,8 +559,8 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         else:
             direction = to_aim / aim_distance
 
-        # Yaw to face the *current* target (not the lead point) so it stays centred in
-        # the forward camera. Slew-rate limited so the camera pans smoothly.
+        # Yaw to face the *current* (predicted) target so it stays centred in the forward
+        # camera. Slew-rate limited so the camera pans smoothly.
         to_target = target_position - self.p
         desired_yaw = float(np.arctan2(to_target[1], to_target[0]))
         yaw_ref, yaw_rate_ref = self._step_yaw(dt, desired_yaw)
@@ -353,5 +576,14 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
 
         p_ref = self.p + v_ref * dt
         p_ref[2] = float(np.clip(p_ref[2], self.min_altitude, self.max_altitude))
+
+        # Publish what we are steering toward for the viewport visualization.
+        self._viz_target_position = np.asarray(target_position, dtype=float)
+        self._viz_target_velocity = np.asarray(target_velocity, dtype=float)
+        self._viz_target_acceleration = np.asarray(target_acceleration, dtype=float)
+        self._viz_aim_point = np.asarray(aim_point, dtype=float)
+        self._viz_time_to_intercept = tti
+        self._viz_coasting = coasting
+        self._viz_active = True
 
         return p_ref, v_ref, np.zeros(3), np.zeros(3), yaw_ref, yaw_rate_ref
