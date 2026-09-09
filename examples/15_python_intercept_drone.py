@@ -50,12 +50,12 @@ from yolo_detector_adapter import YoloDroneDetectorAdapter
 
 # ---- Scenario geometry ----
 PURSUER_SPAWN = np.array([0.0, 0.0, 2.0])          # faces +X toward the target line
-TARGET_CENTER = np.array([12.0, 0.0, 2.5])         # centre of the shuttle line (further away)
+TARGET_CENTER = np.array([10.0, 0.0, 2.0])         # centre of the shuttle line (further away)
 TARGET_AXIS = np.array([0.0, 1.0, 0.0])            # target crosses left/right (along Y)
-TARGET_AMPLITUDE = 15.0                            # metres each side of centre (30 m sweep, ~60 m per cycle)
-TARGET_ANGULAR_VELOCITY = 0.18                     # rad/s; peak speed ~ A * omega = 2.7 m/s (< PURSUER_SPEED)
+TARGET_AMPLITUDE = 50.0                            # metres each side of centre (30 m sweep, ~60 m per cycle)
+TARGET_ANGULAR_VELOCITY = 0.1                     # rad/s; peak speed ~ A * omega = 2.7 m/s (< PURSUER_SPEED)
 
-PURSUER_SPEED = 3.5                                # commanded closing speed [m/s]
+PURSUER_SPEED = 8.5                                # commanded closing speed [m/s]
 LEAD_ENABLED = True                                # False -> naive pure pursuit
 STARTUP_DELAY_S = 5.0
 
@@ -147,6 +147,7 @@ class PegasusApp:
             speed_ramp_time_s=3.0,       # ease 0 -> full speed over 3 s after acquiring
             velocity_time_constant_s=0.6,  # low-pass on commanded velocity
             alignment_min=0.2,           # mostly rotate-to-face before accelerating
+            coast_time_s=5.0,            # keep flying the last trajectory when detection drops
             startup_delay=STARTUP_DELAY_S,
             image_size=CAMERA_CONFIG["resolution"],
             show_debug_feed=True,

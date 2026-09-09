@@ -102,6 +102,7 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         min_altitude: float = 0.6,
         max_altitude: float = 10.0,
         lead_enabled: bool = True,
+        coast_time_s: float = 2.5,               # keep pursuing last trajectory this long after a detection drop
         # --- smoothness / camera-stability shaping ---
         max_yaw_rate: float = 1.2,               # rad/s cap on how fast the camera pans
         speed_ramp_time_s: float = 2.5,          # ramp 0 -> pursuer_speed after (re)acquiring
@@ -122,6 +123,7 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self.min_altitude = float(min_altitude)
         self.max_altitude = float(max_altitude)
         self.lead_enabled = bool(lead_enabled)
+        self.coast_time_s = float(coast_time_s)
 
         self.max_yaw_rate = float(max_yaw_rate)
         self.speed_ramp_time_s = float(speed_ramp_time_s)
@@ -149,6 +151,11 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self._filtered_velocity_ref: np.ndarray | None = None
         self._pursuit_start_time: float | None = None
 
+        # Last-known target memory (for coasting through detection dropouts).
+        self._last_target_position: np.ndarray | None = None
+        self._last_target_velocity: np.ndarray | None = None
+        self._last_seen_time: float | None = None
+
     def reset_episode(self) -> None:
         super().reset_episode()
         self._estimator.reset()
@@ -159,6 +166,9 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         self._time_to_intercept = None
         self._filtered_velocity_ref = None
         self._pursuit_start_time = None
+        self._last_target_position = None
+        self._last_target_velocity = None
+        self._last_seen_time = None
 
     def _pursuer_yaw(self) -> float:
         forward = self.R.as_matrix()[:, 0]
@@ -248,7 +258,14 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
                     )
                 self._aim_point = aim_point
                 self._time_to_intercept = tti
+
+                # Remember the last good fix so we can coast through detection dropouts.
+                self._last_target_position = estimate.position.copy()
+                self._last_target_velocity = estimate.velocity.copy()
+                self._last_seen_time = self._sim_time
             else:
+                # No usable detection this frame: keep the last-known target/trajectory so
+                # _vision_references can dead-reckon it (coast) instead of stopping.
                 self._target_position = None
                 self._target_velocity = None
                 self._distance_m = None
@@ -309,25 +326,64 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         fraction = np.clip((self._sim_time - self._pursuit_start_time) / self.speed_ramp_time_s, 0.0, 1.0)
         return float(fraction * fraction * (3.0 - 2.0 * fraction))
 
+    def _coast_target(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        Dead-reckon the last-known target for up to coast_time_s after a detection drop.
+
+        Returns (predicted_position, velocity) using the last good fix propagated along its
+        last measured velocity, or None if there is no recent enough fix to coast on.
+        """
+        if (
+            self._last_target_position is not None
+            and self._last_seen_time is not None
+            and (self._sim_time - self._last_seen_time) <= self.coast_time_s
+        ):
+            velocity = (
+                self._last_target_velocity
+                if self._last_target_velocity is not None
+                else np.zeros(3)
+            )
+            elapsed = self._sim_time - self._last_seen_time
+            return self._last_target_position + velocity * elapsed, velocity
+        return None
+
     def _vision_references(
         self, dt: float
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
         if self._yaw_ref is None:
             self._init_yaw_reference()
 
-        if not self._has_detection or self._target_position is None:
-            return self._search_references(dt)
-
-        target_position = self._target_position
-
-        # Choose the point to fly toward: the intercept lead point when available,
-        # otherwise fall back to the target's current position (pure pursuit).
-        if self.lead_enabled and self._aim_point is not None:
-            aim_point = self._aim_point
-            self._last_status = "intercepting"
+        if self._has_detection and self._target_position is not None:
+            # Fresh detection: use it and the lead point solved in update_graphical_sensor.
+            target_position = self._target_position
+            if self.lead_enabled and self._aim_point is not None:
+                aim_point = self._aim_point
+                self._last_status = "intercepting"
+            else:
+                aim_point = target_position
+                self._last_status = "pursuing"
         else:
-            aim_point = target_position
-            self._last_status = "pursuing"
+            # No fresh detection: coast on the remembered trajectory if it is recent enough,
+            # recomputing the intercept from the dead-reckoned position. Only a real fix (in
+            # update_graphical_sensor) ever refreshes the remembered target.
+            coasted = self._coast_target()
+            if coasted is None:
+                return self._search_references(dt)
+
+            target_position, target_velocity = coasted
+            aim_point, tti = (None, None)
+            if self.lead_enabled:
+                aim_point, tti = solve_intercept(
+                    self.p,
+                    self.pursuer_speed,
+                    target_position,
+                    target_velocity,
+                    max_time_s=self.max_intercept_time_s,
+                )
+            self._time_to_intercept = tti
+            if aim_point is None:
+                aim_point = target_position
+            self._last_status = "coasting"
 
         to_aim = aim_point - self.p
         aim_distance = float(np.linalg.norm(to_aim))
