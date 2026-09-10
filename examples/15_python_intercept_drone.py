@@ -45,13 +45,25 @@ sys.path.insert(0, UTILS_DIR)
 
 from forward_intercept_controller import ForwardInterceptController
 from linear_shuttle_controller import LinearShuttleController
+from random_shuttle_spawn import sample_shuttle_spawn
 from track import YoloDroneTracker
 from yolo_detector_adapter import YoloDroneDetectorAdapter
 
 # ---- Scenario geometry ----
 PURSUER_SPAWN = np.array([0.0, 0.0, 2.0])          # faces +X toward the target line
-TARGET_CENTER = np.array([10.0, 0.0, 2.0])         # centre of the shuttle line (further away)
-TARGET_AXIS = np.array([0.0, 1.0, 0.0])            # target crosses left/right (along Y)
+
+# Randomized target spawn + heading (set TARGET_SEED to an int for a reproducible run).
+TARGET_SEED = None
+_TARGET_SPAWN = sample_shuttle_spawn(
+    x_range=(4.0, 16.0),
+    y_range=(-5.0, 5.0),
+    z_range=(0.5, 5.0),
+    max_yaw_deg=30.0,                              # flight direction within +-30 deg of +Y
+    seed=TARGET_SEED,
+)
+TARGET_CENTER = _TARGET_SPAWN.center               # centre of the shuttle line == spawn point
+TARGET_AXIS = _TARGET_SPAWN.axis                   # crosses roughly along Y, tilted by yaw_deg
+TARGET_YAW_DEG = _TARGET_SPAWN.yaw_deg
 TARGET_AMPLITUDE = 50.0                            # metres each side of centre (30 m sweep, ~60 m per cycle)
 TARGET_ANGULAR_VELOCITY = 0.1                     # rad/s; peak speed ~ A * omega = 2.7 m/s (< PURSUER_SPEED)
 
@@ -207,7 +219,9 @@ class PegasusApp:
         self.world.reset()
         carb.log_info(
             "Intercept demo ready — pursuer predicts the target trajectory and aims at the "
-            f"lead point (LEAD_ENABLED={LEAD_ENABLED}). The predicted trajectory and intercept "
+            f"lead point (LEAD_ENABLED={LEAD_ENABLED}). Target spawn="
+            f"[{TARGET_CENTER[0]:.2f}, {TARGET_CENTER[1]:.2f}, {TARGET_CENTER[2]:.2f}], "
+            f"heading={TARGET_YAW_DEG:+.1f} deg from +Y. The predicted trajectory and intercept "
             "point are drawn on the onboard camera preview (never on the detector frame)."
         )
 
