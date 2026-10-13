@@ -26,7 +26,6 @@ import numpy as np
 
 from torpedo_controller_pluggable import PluggableTorpedoVisionController
 from world_intercept import (
-    CAMERA_TO_BODY,
     IRIS_DRONE_WIDTH_M,
     TargetWorldEstimator,
     solve_intercept_iterative,
@@ -147,6 +146,8 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         climb_rate_gain: float = 1.0,            # P gain (1/s) mapping altitude error -> vertical speed
         max_climb_rate: float = 1.5,             # m/s cap on climb (kept low to avoid ballooning up)
         max_descent_rate: float = 2.5,           # m/s cap on descent (higher so it can shed altitude)
+        camera_offset_body: tuple[float, float, float] = (0.15, 0.0, 0.0),
+        camera_to_body: np.ndarray | None = None,
         **kwargs: Any,
     ):
         if not callable(getattr(detector, "detect", None)):
@@ -187,6 +188,8 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
             acceleration_smoothing=acceleration_smoothing,
             min_bbox_width_px=min_bbox_width_px,
             max_acceleration_mps2=max_target_accel_mps2,
+            camera_offset_body=camera_offset_body,
+            camera_to_body=camera_to_body,
         )
 
         # Latest world-frame estimate / intercept solution (consumed by _vision_references).
@@ -271,8 +274,8 @@ class ForwardInterceptController(PluggableTorpedoVisionController):
         camera_position = self.p + R @ self._estimator.camera_offset_body
 
         rel = np.asarray(world_point, dtype=float) - camera_position
-        # World -> body -> camera frame (CAMERA_TO_BODY is orthonormal, so inverse = transpose).
-        dir_camera = CAMERA_TO_BODY.T @ (R.T @ rel)
+        # World -> body -> camera frame (camera_to_body is orthonormal, so inverse = transpose).
+        dir_camera = self._estimator.camera_to_body.T @ (R.T @ rel)
         forward_comp = float(dir_camera[2])
         if forward_comp <= 1e-3:
             return None

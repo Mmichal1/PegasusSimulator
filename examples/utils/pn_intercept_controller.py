@@ -185,6 +185,7 @@ class PNInterceptController(ForwardInterceptController):
             carb.log_warn(
                 "[PN_TELEMETRY] "
                 f"t={self._sim_time:.2f} range={rng:.2f} closing={closing_speed:.2f} "
+                f"p={np.round(self.p, 2).tolist()} tgt={np.round(target_position, 2).tolist()} "
                 f"target_radial={target_radial_speed:.2f} pursuer_radial={actual_radial_speed:.2f} "
                 f"dir_los_cos={direction_los_cos:.3f} speed_cmd={speed:.2f} "
                 f"a_cmd={np.linalg.norm(a_cmd):.2f} coasting={coasting}"

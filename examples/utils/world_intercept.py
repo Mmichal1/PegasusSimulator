@@ -43,6 +43,18 @@ CAMERA_TO_BODY = np.array(
     ]
 )
 
+# Same convention after pitching the forward camera up 90 deg (boresight = body +Z):
+#   camera +X (image right)   = body -Y
+#   camera +Y (image down)    = body +X
+#   camera +Z (boresight/up)  = body +Z
+CAMERA_TO_BODY_UPWARD = np.array(
+    [
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+)
+
 
 @dataclass
 class TargetEstimate:
@@ -195,12 +207,18 @@ class TargetWorldEstimator:
         max_velocity_mps: float = 12.0,
         max_acceleration_mps2: float = 15.0,
         camera_offset_body: tuple[float, float, float] = (0.15, 0.0, 0.0),
+        camera_to_body: np.ndarray | None = None,
     ):
         self.image_width = int(image_width)
         self.image_height = int(image_height)
         self.fov_deg = float(fov_deg)
         self.target_width_m = float(target_width_m)
         self.camera_offset_body = np.asarray(camera_offset_body, dtype=float)
+        self.camera_to_body = (
+            np.asarray(CAMERA_TO_BODY, dtype=float)
+            if camera_to_body is None
+            else np.asarray(camera_to_body, dtype=float)
+        )
         self.position_smoothing = float(position_smoothing)
         self.velocity_smoothing = float(velocity_smoothing)
         self.acceleration_smoothing = float(acceleration_smoothing)
@@ -246,10 +264,10 @@ class TargetWorldEstimator:
         y_offset = (float(v) - 0.5 * self.image_height) / self.fx
 
         camera_ray = np.array([x_offset, y_offset, 1.0])
-        direction = pursuer_rotation @ (CAMERA_TO_BODY @ camera_ray)
+        direction = pursuer_rotation @ (self.camera_to_body @ camera_ray)
         norm = float(np.linalg.norm(direction))
         if norm < 1e-9:
-            return pursuer_rotation @ np.array([1.0, 0.0, 0.0])
+            return pursuer_rotation @ self.camera_to_body[:, 2]
         return direction / norm
 
     def _smooth_position(self, measurement: np.ndarray) -> np.ndarray:
