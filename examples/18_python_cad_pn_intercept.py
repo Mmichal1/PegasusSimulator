@@ -10,8 +10,10 @@
 | - One Iris target is stationary or follows a slow straight/circular path.
 | - Camera-bearing PN uses centroid bearing rate and interceptor state only.
 |   Simulator target truth is restricted to scoring and explicit oracle diagnostics.
-| - The onboard camera is recorded to MP4 with no overlays (PEGASUS_RECORD=0 to
-|   disable). Files go to examples/recordings/ unless PEGASUS_RECORD_PATH is set.
+| - The onboard camera, interceptor and target third-person cameras, and a
+|   stationary ground camera are recorded to MP4 (PEGASUS_RECORD=0 to disable).
+|   Files go to
+|   examples/recordings/ unless PEGASUS_RECORD_PATH is set.
 |
 | Useful environment variables:
 |   PEGASUS_TARGET_SEED=0
@@ -26,6 +28,8 @@
 |   PEGASUS_PURSUER_START_ALTITUDE_M=1.5
 |   PEGASUS_HORIZONTAL_LOCK_DELAY_S=3.5
 |   PEGASUS_RUN_DURATION_S=22
+|   PEGASUS_RECORD=0
+|   PEGASUS_RECORD_PATH=/path/onboard.mp4  # third-person siblings are derived
 |   PEGASUS_TELEMETRY=1
 |   PEGASUS_TELEMETRY_PATH=/path/run.csv
 |   PEGASUS_SUMMARY_PATH=/path/run.summary.json
@@ -49,6 +53,7 @@ simulation_app = SimulationApp({"headless": HEADLESS})
 import isaacsim.core.utils.prims as prim_utils
 import numpy as np
 import omni.timeline
+from isaacsim.sensors.camera.camera import Camera
 from omni.isaac.core.world import World
 from scipy.spatial.transform import Rotation
 
@@ -210,6 +215,35 @@ CAMERA_CONFIG = {
     "fov": 70.0,
     "clipping_range": (0.08, 100.0),
 }
+PURSUER_THIRD_PERSON_CAMERA_CONFIG = {
+    "resolution": CAMERA_CONFIG["resolution"],
+    "frequency": CAMERA_CONFIG["frequency"],
+    "depth": False,
+    # Follow behind the rocket's -Z tail and look forward along its +Z nose.
+    "position": np.array([0.0, 0.0, -3.0]),
+    "orientation": CAMERA_CONFIG["orientation"],
+    "fov": 80.0,
+    "clipping_range": (0.1, 150.0),
+}
+TARGET_THIRD_PERSON_CAMERA_CONFIG = {
+    "resolution": CAMERA_CONFIG["resolution"],
+    "frequency": CAMERA_CONFIG["frequency"],
+    "depth": False,
+    "fov": 80.0,
+    "clipping_range": (0.1, 150.0),
+}
+GROUND_CAMERA_CONFIG = {
+    "resolution": (1280, 720),
+    "frequency": CAMERA_CONFIG["frequency"],
+    "depth": False,
+    "fov": 80.0,
+    "clipping_range": (0.1, 200.0),
+}
+
+OUTDOOR_SKY_HDR = (
+    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
+    "Assets/Isaac/4.5/NVIDIA/Assets/Skies/Cloudy/abandoned_parking_4k.hdr"
+)
 
 
 class CadPNInterceptController(PNInterceptController):
@@ -221,6 +255,7 @@ class CadPNInterceptController(PNInterceptController):
         self,
         *args,
         recorder: CameraMp4Recorder | None = None,
+        third_person_recorder: CameraMp4Recorder | None = None,
         guidance_mode: str = "camera_pn",
         bearing_filter_tau_s: float = 0.08,
         los_rate_filter_tau_s: float = 0.15,
@@ -278,6 +313,7 @@ class CadPNInterceptController(PNInterceptController):
         self._oracle_target_position: np.ndarray | None = None
         self._oracle_target_velocity: np.ndarray | None = None
         self._recorder = recorder
+        self._third_person_recorder = third_person_recorder
 
     def reset_episode(self) -> None:
         super().reset_episode()
@@ -318,16 +354,28 @@ class CadPNInterceptController(PNInterceptController):
         self._oracle_target_velocity = np.asarray(velocity, dtype=float).copy()
 
     def update_graphical_sensor(self, sensor_type: str, data: dict) -> None:
-        if self._recorder is not None and sensor_type == "MonocularCamera" and data:
+        if sensor_type == "MonocularCamera" and data:
             camera = data.get("camera")
-            if camera is not None:
+            camera_name = str(data.get("camera_name", ""))
+            recorder = (
+                self._third_person_recorder
+                if camera_name.startswith("third_person_pursuer")
+                else self._recorder
+                if camera_name.startswith("camera")
+                else None
+            )
+            if camera is not None and recorder is not None:
                 try:
-                    self._recorder.write(camera.get_rgba())
+                    recorder.write(camera.get_rgba())
                 except Exception as exc:
                     carb.log_warn(f"[CAD PN] camera record failed: {exc}")
-        super().update_graphical_sensor(sensor_type, data)
-        if sensor_type != "MonocularCamera":
+        if (
+            sensor_type != "MonocularCamera"
+            or not data
+            or not str(data.get("camera_name", "")).startswith("camera")
+        ):
             return
+        super().update_graphical_sensor(sensor_type, data)
         self._ingest_bearing(self._pixel_bearing_world())
 
     def _slew_toward(self, desired: np.ndarray, dt: float) -> np.ndarray:
@@ -559,11 +607,45 @@ class CadPNInterceptController(PNInterceptController):
         }
 
 
-def _default_record_path(motion) -> str:
+def _record_paths(motion) -> dict[str, str]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     seed = "rand" if TARGET_SEED is None else str(TARGET_SEED)
-    name = f"chase_{stamp}_{motion.kind}_seed{seed}.mp4"
-    return os.path.join(RECORD_DIR, name)
+    if RECORD_PATH:
+        onboard = os.path.abspath(RECORD_PATH)
+        stem, extension = os.path.splitext(onboard)
+        extension = extension or ".mp4"
+        base = stem.removesuffix("_onboard")
+    else:
+        base = os.path.join(
+            RECORD_DIR, f"chase_{stamp}_{motion.kind}_seed{seed}"
+        )
+        extension = ".mp4"
+        onboard = f"{base}_onboard{extension}"
+    return {
+        "onboard": onboard,
+        "pursuer_third_person": f"{base}_pursuer_third_person{extension}",
+        "target_third_person": f"{base}_target_third_person{extension}",
+        "ground": f"{base}_ground{extension}",
+    }
+
+
+def _look_at_world_orientation(
+    camera_position: np.ndarray, look_at: np.ndarray
+) -> np.ndarray:
+    """Scalar-first quaternion for a +X-forward, +Z-up world camera."""
+    forward = np.asarray(look_at, dtype=float) - np.asarray(camera_position, dtype=float)
+    forward_norm = float(np.linalg.norm(forward))
+    if forward_norm < 1e-9:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    forward /= forward_norm
+    up_hint = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(forward, up_hint))) > 0.95:
+        up_hint = np.array([0.0, 1.0, 0.0])
+    left = np.cross(up_hint, forward)
+    left /= np.linalg.norm(left)
+    up = np.cross(forward, left)
+    xyzw = Rotation.from_matrix(np.column_stack((forward, left, up))).as_quat()
+    return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
 
 def _diagnostic_paths(motion) -> tuple[str, str]:
@@ -668,31 +750,25 @@ def self_motion_kind(ctrl: CadPNInterceptController) -> str:
     return str(getattr(ctrl, "_diagnostic_motion_kind", TARGET_MOTION))
 
 
-def setup_bright_lighting():
+def setup_outdoor_lighting():
     prim_utils.create_prim(
         "/World/Light/DomeLight",
         "DomeLight",
-        position=np.array([0.0, 0.0, 10.0]),
-        attributes={"inputs:intensity": 3000.0, "inputs:color": (1.0, 1.0, 1.0)},
+        position=np.array([0.0, 0.0, 0.0]),
+        attributes={
+            "inputs:intensity": 1200.0,
+            "inputs:color": (1.0, 1.0, 1.0),
+            "inputs:texture:file": OUTDOOR_SKY_HDR,
+        },
     )
     prim_utils.create_prim(
         "/World/Light/Sun",
         "DistantLight",
         orientation=Rotation.from_euler("XYZ", [-50.0, 0.0, 30.0], degrees=True).as_quat(),
         attributes={
-            "inputs:intensity": 7000.0,
+            "inputs:intensity": 3500.0,
             "inputs:angle": 1.0,
             "inputs:color": (1.0, 0.98, 0.95),
-        },
-    )
-    prim_utils.create_prim(
-        "/World/Light/Fill",
-        "DistantLight",
-        orientation=Rotation.from_euler("XYZ", [-20.0, 0.0, -140.0], degrees=True).as_quat(),
-        attributes={
-            "inputs:intensity": 2800.0,
-            "inputs:angle": 1.2,
-            "inputs:color": (0.95, 0.95, 1.0),
         },
     )
 
@@ -710,7 +786,7 @@ class PegasusApp:
         self.world = self.pg.world
 
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Flat Plane"])
-        setup_bright_lighting()
+        setup_outdoor_lighting()
 
         if not os.path.exists(CAD_USD):
             raise FileNotFoundError(
@@ -752,17 +828,21 @@ class PegasusApp:
         )
         if self.telemetry is not None:
             carb.log_warn(f"[CAD PN] telemetry CSV: {self.telemetry.path}")
-        self.recorder = None
+        self.recorders: dict[str, CameraMp4Recorder] = {}
         if RECORD_ENABLED:
-            record_path = RECORD_PATH or _default_record_path(self.target_motion)
-            self.recorder = CameraMp4Recorder(
-                record_path, fps=float(CAMERA_CONFIG["frequency"])
-            )
-            carb.log_warn(f"[CAD PN] recording raw camera to {self.recorder.path}")
+            for camera_name, record_path in _record_paths(self.target_motion).items():
+                self.recorders[camera_name] = CameraMp4Recorder(
+                    record_path, fps=float(CAMERA_CONFIG["frequency"])
+                )
+                carb.log_warn(
+                    f"[CAD PN] recording {camera_name} camera to "
+                    f"{self.recorders[camera_name].path}"
+                )
 
         self.pursuer_controller = CadPNInterceptController(
             detector=detector,
-            recorder=self.recorder,
+            recorder=self.recorders.get("onboard"),
+            third_person_recorder=self.recorders.get("pursuer_third_person"),
             guidance_mode=GUIDANCE_MODE,
             pursuer_speed=PURSUER_SPEED,
             nav_constant=NAV_CONSTANT,
@@ -812,7 +892,13 @@ class PegasusApp:
 
         pursuer_config = MultirotorConfig()
         pursuer_config.backends = [self.pursuer_controller]
-        pursuer_config.graphical_sensors = [MonocularCamera("camera", config=CAMERA_CONFIG)]
+        pursuer_config.graphical_sensors = [
+            MonocularCamera("camera", config=CAMERA_CONFIG),
+            MonocularCamera(
+                "third_person_pursuer",
+                config=PURSUER_THIRD_PERSON_CAMERA_CONFIG,
+            ),
+        ]
 
         Multirotor(
             "/World/pursuer_drone",
@@ -839,16 +925,116 @@ class PegasusApp:
             config=target_config,
         )
 
+        self.target_chase_camera = None
+        self._last_target_chase_frame_time = -np.inf
+        self._target_camera_direction = np.array([-1.0, 0.0, -0.2])
+        self._target_camera_direction /= np.linalg.norm(self._target_camera_direction)
+        if "target_third_person" in self.recorders:
+            self.target_chase_camera = Camera(
+                prim_path="/World/target_third_person_camera",
+                frequency=float(TARGET_THIRD_PERSON_CAMERA_CONFIG["frequency"]),
+                resolution=TARGET_THIRD_PERSON_CAMERA_CONFIG["resolution"],
+            )
+        self.ground_camera = None
+        self._last_ground_frame_time = -np.inf
+        self._ground_camera_position = np.array(
+            [TARGET_X_AT_LAUNCH_M + 3.0, -14.0, 1.2]
+        )
+        self._ground_camera_look_at = np.array(
+            [TARGET_X_AT_LAUNCH_M + 3.0, 0.0, 9.0]
+        )
+        if "ground" in self.recorders:
+            self.ground_camera = Camera(
+                prim_path="/World/ground_interception_camera",
+                frequency=float(GROUND_CAMERA_CONFIG["frequency"]),
+                resolution=GROUND_CAMERA_CONFIG["resolution"],
+            )
+
         midpoint = 0.5 * (PURSUER_SPAWN + self.target_motion.spawn)
         self.pg.set_viewport_camera(
             [8.0, -8.0, float(midpoint[2])],
             midpoint.tolist(),
         )
         self.world.reset()
+        if self.target_chase_camera is not None:
+            self.target_chase_camera.initialize()
+            self.target_chase_camera.set_resolution(
+                TARGET_THIRD_PERSON_CAMERA_CONFIG["resolution"],
+                maintain_square_pixels=True,
+            )
+            self.target_chase_camera.set_clipping_range(
+                *TARGET_THIRD_PERSON_CAMERA_CONFIG["clipping_range"]
+            )
+            self.target_chase_camera.set_frequency(
+                float(TARGET_THIRD_PERSON_CAMERA_CONFIG["frequency"])
+            )
+            self._position_target_chase_camera(
+                PURSUER_SPAWN, self.target_motion.spawn
+            )
+        if self.ground_camera is not None:
+            self.ground_camera.initialize()
+            self.ground_camera.set_resolution(
+                GROUND_CAMERA_CONFIG["resolution"],
+                maintain_square_pixels=True,
+            )
+            self.ground_camera.set_clipping_range(
+                *GROUND_CAMERA_CONFIG["clipping_range"]
+            )
+            self.ground_camera.set_frequency(float(GROUND_CAMERA_CONFIG["frequency"]))
+            # 20.955 mm horizontal aperture with a 12.5 mm focal length gives
+            # roughly an 80-degree horizontal FOV, wide enough for the launch
+            # and intercept to remain in one stationary shot. Isaac uses cm.
+            self.ground_camera.set_focal_length(1.25)
+            self.ground_camera.set_world_pose(
+                position=self._ground_camera_position,
+                orientation=_look_at_world_orientation(
+                    self._ground_camera_position, self._ground_camera_look_at
+                ),
+                camera_axes="world",
+            )
         carb.log_warn(
             "[CAD PN] ready — single CAD rocket pursuer vs target "
             f"({self.target_motion.describe()}, guidance={GUIDANCE_MODE}, "
             f"N={NAV_CONSTANT})."
+        )
+
+    def _position_target_chase_camera(
+        self, pursuer_position: np.ndarray, target_position: np.ndarray
+    ) -> None:
+        if self.target_chase_camera is None:
+            return
+        to_interceptor = np.asarray(pursuer_position, dtype=float) - np.asarray(
+            target_position, dtype=float
+        )
+        separation = float(np.linalg.norm(to_interceptor))
+        if separation > 0.5:
+            direction = to_interceptor / separation
+            self._target_camera_direction = direction
+        else:
+            direction = self._target_camera_direction
+
+        # Stay on the far side of the target, with a lateral offset so the
+        # target does not completely hide the approaching interceptor.
+        up = np.array([0.0, 0.0, 1.0])
+        side = np.cross(up, direction)
+        side_norm = float(np.linalg.norm(side))
+        if side_norm < 1e-6:
+            side = np.array([0.0, 1.0, 0.0])
+        else:
+            side /= side_norm
+        camera_position = (
+            np.asarray(target_position, dtype=float)
+            - 4.0 * direction
+            + 1.5 * side
+            + np.array([0.0, 0.0, 0.8])
+        )
+        look_at = np.asarray(target_position, dtype=float) + min(
+            2.0, 0.2 * separation
+        ) * direction
+        self.target_chase_camera.set_world_pose(
+            position=camera_position,
+            orientation=_look_at_world_orientation(camera_position, look_at),
+            camera_axes="world",
         )
 
     def run(self):
@@ -868,6 +1054,44 @@ class PegasusApp:
                 if ctrl.reveived_first_state:
                     target_p = self.target_controller.p
                     target_v = self.target_controller.v
+                    self._position_target_chase_camera(ctrl.p, target_p)
+                    target_recorder = self.recorders.get("target_third_person")
+                    if (
+                        self.target_chase_camera is not None
+                        and target_recorder is not None
+                        and ctrl._sim_time - self._last_target_chase_frame_time
+                        >= 1.0 / float(TARGET_THIRD_PERSON_CAMERA_CONFIG["frequency"])
+                    ):
+                        self._last_target_chase_frame_time = ctrl._sim_time
+                        try:
+                            target_recorder.write(self.target_chase_camera.get_rgba())
+                        except Exception as exc:
+                            carb.log_warn(
+                                f"[CAD PN] target third-person record failed: {exc}"
+                            )
+                    ground_recorder = self.recorders.get("ground")
+                    if (
+                        self.ground_camera is not None
+                        and ground_recorder is not None
+                        and ctrl._sim_time - self._last_ground_frame_time
+                        >= 1.0 / float(GROUND_CAMERA_CONFIG["frequency"])
+                    ):
+                        self._last_ground_frame_time = ctrl._sim_time
+                        try:
+                            # Reassert the fixed world pose after physics updates;
+                            # unlike a vehicle-mounted sensor, this camera has no
+                            # parent transform maintaining its placement.
+                            self.ground_camera.set_world_pose(
+                                position=self._ground_camera_position,
+                                orientation=_look_at_world_orientation(
+                                    self._ground_camera_position,
+                                    self._ground_camera_look_at,
+                                ),
+                                camera_axes="world",
+                            )
+                            ground_recorder.write(self.ground_camera.get_rgba())
+                        except Exception as exc:
+                            carb.log_warn(f"[CAD PN] ground camera record failed: {exc}")
                     ctrl.set_oracle_target_state(target_p, target_v)
                     miss = float(np.linalg.norm(ctrl.p - target_p))
                     step_dt = max(0.0, ctrl._sim_time - previous_sim_time)
@@ -961,11 +1185,11 @@ class PegasusApp:
             carb.log_warn(f"[CAD PN] summary JSON: {self.summary_path}")
             if self.telemetry is not None:
                 self.telemetry.close()
-            if self.recorder is not None:
-                self.recorder.close()
+            for camera_name, recorder in self.recorders.items():
+                recorder.close()
                 carb.log_warn(
-                    f"[CAD PN] saved {self.recorder.frame_count} camera frames to "
-                    f"{self.recorder.path}"
+                    f"[CAD PN] saved {recorder.frame_count} {camera_name} frames to "
+                    f"{recorder.path}"
                 )
             carb.log_warn("CAD PN intercept simulation closing.")
             self.pursuer_controller._close_debug_preview()
