@@ -55,6 +55,7 @@ def sample_target_motion(
     startup_delay: float = 1.0,
     seed: int | None = None,
     kind: str | None = None,
+    heading_deg: float | None = None,
 ) -> TargetMotion:
     """
     Draw a spawn near ``nominal_spawn`` and either a constant-velocity straight
@@ -85,7 +86,11 @@ def sample_target_motion(
         or (requested_kind == "random" and rng.random() < 0.5)
     )
     if use_straight:
-        yaw = float(rng.uniform(0.0, 2.0 * np.pi))
+        yaw = (
+            float(rng.uniform(0.0, 2.0 * np.pi))
+            if heading_deg is None
+            else float(np.radians(heading_deg))
+        )
         direction = np.array([np.cos(yaw), np.sin(yaw), 0.0])
         return TargetMotion(
             kind="straight",

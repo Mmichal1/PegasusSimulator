@@ -196,6 +196,7 @@ def step_flight_direction(
     speed_mps: float,
     max_turn_rate_rad_s: float,
     min_los_direction_cos: float,
+    los_anchor_time_constant_s: float = 0.0,
 ) -> np.ndarray:
     """Integrate PN acceleration into a unit flight direction with safety limits."""
     u_los = _unit(los_bearing)
@@ -213,6 +214,16 @@ def step_flight_direction(
         turn_rate *= max_turn_rate_rad_s / magnitude
     stepped = _unit(direction + turn_rate * max(float(dt), 0.0))
     direction = u_los.copy() if stepped is None else stepped
+
+    if los_anchor_time_constant_s > 0.0:
+        anchor_alpha = _low_pass_alpha(
+            max(float(dt), 0.0), float(los_anchor_time_constant_s)
+        )
+        anchored = _unit(
+            (1.0 - anchor_alpha) * direction + anchor_alpha * u_los
+        )
+        if anchored is not None:
+            direction = anchored
 
     minimum_cos = float(np.clip(min_los_direction_cos, 0.0, 1.0))
     los_cos = float(np.dot(direction, u_los))

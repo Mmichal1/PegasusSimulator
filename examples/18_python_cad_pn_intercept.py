@@ -17,6 +17,14 @@
 |   PEGASUS_TARGET_SEED=0
 |   PEGASUS_TARGET_MOTION=random|stationary|straight|circle
 |   PEGASUS_GUIDANCE_MODE=camera_pn|pure_pursuit|oracle_pn
+|   PEGASUS_ENGAGEMENT=vertical|horizontal
+|   PEGASUS_TARGET_SPEED_MPS=0.5
+|   PEGASUS_PURSUER_SPEED_MPS=3.0
+|   PEGASUS_TARGET_X_AT_LAUNCH_M=5.0
+|   PEGASUS_TARGET_INITIAL_X_M=<override automatic placement>
+|   PEGASUS_TARGET_ALTITUDE_M=15.0
+|   PEGASUS_PURSUER_START_ALTITUDE_M=1.5
+|   PEGASUS_HORIZONTAL_LOCK_DELAY_S=3.5
 |   PEGASUS_RUN_DURATION_S=22
 |   PEGASUS_TELEMETRY=1
 |   PEGASUS_TELEMETRY_PATH=/path/run.csv
@@ -71,30 +79,102 @@ CAD_USD = os.path.join(MODELS_DIR, "dron_do_symulacji.usd")
 VEHICLE_USD = os.path.join(MODELS_DIR, "dron_do_symulacji_multirotor.usd")
 
 BODY_MASS_KG = 1.3
-PURSUER_SPAWN = np.array([0.0, 0.0, 1.5])
-TARGET_SPAWN_NOMINAL = np.array([0.0, 3.0, 16.0])
-TARGET_SPAWN_JITTER_M = (1.2, 1.2, 0.6)
-TARGET_SPEED_MPS = (0.1, 0.2)
-TARGET_CIRCLE_DIAMETER_M = (3.0, 8.0)
-TARGET_MOTION_STARTUP_S = 1.0
-TARGET_SEED = int(os.getenv("PEGASUS_TARGET_SEED", "0"))
-TARGET_MOTION = os.getenv("PEGASUS_TARGET_MOTION", "random").strip().lower()
+ENGAGEMENT = os.getenv("PEGASUS_ENGAGEMENT", "vertical").strip().lower()
+if ENGAGEMENT not in {"vertical", "horizontal"}:
+    raise ValueError("PEGASUS_ENGAGEMENT must be 'vertical' or 'horizontal'")
+HORIZONTAL_CHASE = ENGAGEMENT == "horizontal"
 
-PURSUER_SPEED = 2.1
+TARGET_SPEED = float(
+    os.getenv("PEGASUS_TARGET_SPEED_MPS", "0.5" if HORIZONTAL_CHASE else "0.15")
+)
+HORIZONTAL_LOCK_DELAY_S = float(
+    os.getenv("PEGASUS_HORIZONTAL_LOCK_DELAY_S", "3.5")
+)
+TARGET_MOTION_STARTUP_S = 1.0
+TARGET_X_AT_LAUNCH_M = float(os.getenv("PEGASUS_TARGET_X_AT_LAUNCH_M", "5.0"))
+target_initial_x_env = os.getenv("PEGASUS_TARGET_INITIAL_X_M")
+TARGET_INITIAL_X_M = (
+    float(target_initial_x_env)
+    if target_initial_x_env is not None
+    else TARGET_X_AT_LAUNCH_M
+    - TARGET_SPEED * max(0.0, HORIZONTAL_LOCK_DELAY_S - TARGET_MOTION_STARTUP_S)
+)
+
+PURSUER_SPAWN = (
+    np.array([0.0, 0.0, float(os.getenv("PEGASUS_PURSUER_START_ALTITUDE_M", "1.5"))])
+    if HORIZONTAL_CHASE
+    else np.array([0.0, 0.0, 1.5])
+)
+TARGET_SPAWN_NOMINAL = (
+    np.array(
+        [
+            TARGET_INITIAL_X_M,
+            0.0,
+            float(os.getenv("PEGASUS_TARGET_ALTITUDE_M", "15.0")),
+        ]
+    )
+    if HORIZONTAL_CHASE
+    else np.array([0.0, 3.0, 16.0])
+)
+TARGET_SPAWN_JITTER_M = (
+    (0.0, 0.0, 0.0) if HORIZONTAL_CHASE else (1.2, 1.2, 0.6)
+)
+TARGET_SPEED_MPS = (TARGET_SPEED, TARGET_SPEED)
+TARGET_CIRCLE_DIAMETER_M = (3.0, 8.0)
+TARGET_SEED = int(os.getenv("PEGASUS_TARGET_SEED", "0"))
+TARGET_MOTION = os.getenv(
+    "PEGASUS_TARGET_MOTION", "straight" if HORIZONTAL_CHASE else "random"
+).strip().lower()
+
+PURSUER_SPEED = float(
+    os.getenv("PEGASUS_PURSUER_SPEED_MPS", "3.0" if HORIZONTAL_CHASE else "2.1")
+)
 NAV_CONSTANT = float(os.getenv("PEGASUS_PN_NAV_CONSTANT", "4.5"))
 MAX_LATERAL_ACCEL_MPS2 = float(
-    os.getenv("PEGASUS_PN_MAX_LATERAL_ACCEL_MPS2", "6.0")
+    os.getenv(
+        "PEGASUS_PN_MAX_LATERAL_ACCEL_MPS2",
+        "1.5" if HORIZONTAL_CHASE else "6.0",
+    )
 )
-MAX_TURN_RATE_RAD_S = float(os.getenv("PEGASUS_PN_MAX_TURN_RATE_RAD_S", "2.5"))
-BEARING_FILTER_TAU_S = float(os.getenv("PEGASUS_PN_BEARING_FILTER_TAU_S", "0.08"))
-LOS_RATE_FILTER_TAU_S = float(os.getenv("PEGASUS_PN_LOS_RATE_FILTER_TAU_S", "0.15"))
-BEARING_COAST_TIME_S = float(os.getenv("PEGASUS_PN_BEARING_COAST_TIME_S", "0.35"))
+MAX_TURN_RATE_RAD_S = float(
+    os.getenv("PEGASUS_PN_MAX_TURN_RATE_RAD_S", "1.0" if HORIZONTAL_CHASE else "2.5")
+)
+BEARING_FILTER_TAU_S = float(
+    os.getenv("PEGASUS_PN_BEARING_FILTER_TAU_S", "0.20" if HORIZONTAL_CHASE else "0.08")
+)
+LOS_RATE_FILTER_TAU_S = float(
+    os.getenv("PEGASUS_PN_LOS_RATE_FILTER_TAU_S", "0.50" if HORIZONTAL_CHASE else "0.15")
+)
+BEARING_COAST_TIME_S = float(
+    os.getenv("PEGASUS_PN_BEARING_COAST_TIME_S", "3.0" if HORIZONTAL_CHASE else "0.35")
+)
 CLOSING_FLOOR_FRACTION = float(
     os.getenv("PEGASUS_PN_CLOSING_FLOOR_FRACTION", "0.35")
 )
-CAMERA_CONE_DEG = float(os.getenv("PEGASUS_PN_CAMERA_CONE_DEG", "30.0"))
+CAMERA_CONE_DEG = float(
+    os.getenv(
+        "PEGASUS_PN_CAMERA_CONE_DEG",
+        str(
+            (
+                23.5 + max(0.0, PURSUER_SPEED - 3.0)
+                if PURSUER_SPEED <= 4.5
+                else max(12.0, 25.0 - (19.0 / 3.0) * (PURSUER_SPEED - 4.5))
+            )
+            if HORIZONTAL_CHASE
+            else 30.0
+        ),
+    )
+)
 GUIDANCE_MODE = os.getenv("PEGASUS_GUIDANCE_MODE", "camera_pn").strip().lower()
-STARTUP_DELAY_S = 5.0
+# In horizontal mode, no-target search already hovers upright. Launch immediately
+# when the first camera bearing becomes available instead of imposing a second hold.
+STARTUP_DELAY_S = 0.0 if HORIZONTAL_CHASE else 5.0
+MAX_FORWARD_ACCEL_MPS2 = float(
+    os.getenv(
+        "PEGASUS_MAX_FORWARD_ACCEL_MPS2",
+        "18.0" if HORIZONTAL_CHASE else "3.5",
+    )
+)
 
 FILTERED_DETECTION_DIR = os.path.join(EXAMPLES_DIR, "filtered_detection")
 DETECTOR_MODEL = os.path.join(
@@ -111,7 +191,9 @@ RECORD_PATH = os.getenv("PEGASUS_RECORD_PATH")
 TELEMETRY_ENABLED = os.getenv("PEGASUS_TELEMETRY", "1") != "0"
 TELEMETRY_PATH = os.getenv("PEGASUS_TELEMETRY_PATH")
 SUMMARY_PATH = os.getenv("PEGASUS_SUMMARY_PATH")
-HIT_RADIUS_M = float(os.getenv("PEGASUS_HIT_RADIUS_M", "0.5"))
+HIT_RADIUS_M = float(
+    os.getenv("PEGASUS_HIT_RADIUS_M", "0.25" if HORIZONTAL_CHASE else "0.5")
+)
 
 # CAD camera stand is at ~[0, 0, 0.13] m; the nose cone (`gora`) extends to ~0.15 m.
 # Sit the camera above the beak so it is not inside the mesh, looking up body +Z.
@@ -124,6 +206,7 @@ CAMERA_CONFIG = {
     # Opposite pitch of the previous mount: [0, -90, 180] was looking down at
     # the CAD body. +90 deg pitches the boresight to body +Z (up the beak).
     "orientation": np.array([0.0, 90.0, 180.0]),
+    # A wide lens made the side-on Iris too small for the detector at launch.
     "fov": 70.0,
     "clipping_range": (0.08, 100.0),
 }
@@ -144,6 +227,14 @@ class CadPNInterceptController(PNInterceptController):
         bearing_coast_time_s: float = 0.35,
         closing_floor_fraction: float = 0.35,
         camera_cone_deg: float = 30.0,
+        max_forward_accel_mps2: float = 3.5,
+        forward_speed_gain: float = 2.2,
+        gravity_compensation_priority: bool = False,
+        altitude_thrust_priority: bool = False,
+        pn_los_anchor_tau_s: float = 0.0,
+        pn_accel_feedforward: float = 1.0,
+        launch_direction: np.ndarray | None = None,
+        launch_acquisition_time_s: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -165,6 +256,19 @@ class CadPNInterceptController(PNInterceptController):
         self._camera_cone_cos = float(
             np.cos(np.radians(np.clip(camera_cone_deg, 1.0, 89.0)))
         )
+        self.max_forward_accel_mps2 = float(max_forward_accel_mps2)
+        self.forward_speed_gain = float(forward_speed_gain)
+        self.gravity_compensation_priority = bool(gravity_compensation_priority)
+        self.altitude_thrust_priority = bool(altitude_thrust_priority)
+        self.pn_los_anchor_tau_s = float(pn_los_anchor_tau_s)
+        self.pn_accel_feedforward = float(pn_accel_feedforward)
+        self.launch_direction = None
+        if launch_direction is not None:
+            launch = np.asarray(launch_direction, dtype=float)
+            launch_norm = float(np.linalg.norm(launch))
+            if launch_norm > 1e-9:
+                self.launch_direction = launch / launch_norm
+        self.launch_acquisition_time_s = float(launch_acquisition_time_s)
         self._hit_dir: np.ndarray | None = None
         self._cmd_dir: np.ndarray | None = None
         self._los_rate = np.zeros(3)
@@ -286,6 +390,26 @@ class CadPNInterceptController(PNInterceptController):
                 if self.guidance_mode == "camera_pn" and rate_valid:
                     self._guidance_accel = command.acceleration
 
+        if (
+            u_los is None
+            and self.launch_direction is not None
+            and self._sim_time <= self.launch_acquisition_time_s
+        ):
+            u_los = self.launch_direction.copy()
+            self._set_hit_dir(u_los)
+            direction = self._slew_toward(u_los, dt)
+            self._guidance_active = True
+            self._last_status = "launch-acquisition"
+            v_ref = direction * self.pursuer_speed
+            return (
+                self.p + v_ref * dt,
+                v_ref,
+                np.zeros(3),
+                np.zeros(3),
+                0.0,
+                0.0,
+            )
+
         if u_los is None:
             self._cmd_dir = None
             self._last_status = "searching"
@@ -304,6 +428,7 @@ class CadPNInterceptController(PNInterceptController):
                 self.pursuer_speed,
                 max_turn_rate_rad_s=self.max_turn_rate_rad_s,
                 min_los_direction_cos=self.min_los_direction_cos,
+                los_anchor_time_constant_s=self.pn_los_anchor_tau_s,
             )
             self._cmd_dir = direction
             status = self.guidance_mode
@@ -349,7 +474,13 @@ class CadPNInterceptController(PNInterceptController):
         else:
             align = 1.0
         v_cmd = self.pursuer_speed * (0.4 + 0.6 * align)
-        a_along = float(np.clip(2.2 * (v_cmd - v_along), -4.0, 3.5))
+        a_along = float(
+            np.clip(
+                self.forward_speed_gain * (v_cmd - v_along),
+                -max(4.0, min(self.max_forward_accel_mps2, self.pursuer_speed)),
+                self.max_forward_accel_mps2,
+            )
+        )
         a_perp = -3.5 * v_perp
         perp_norm = float(np.linalg.norm(a_perp))
         if perp_norm > 8.0:
@@ -357,21 +488,33 @@ class CadPNInterceptController(PNInterceptController):
         specific = (
             a_along * flight_dir
             + a_perp
-            + self._guidance_accel
+            + self.pn_accel_feedforward * self._guidance_accel
             + np.array([0.0, 0.0, self.g])
         )
         spec_norm = float(np.linalg.norm(specific))
         z_des = specific / spec_norm if spec_norm > 1e-6 else u_los.copy()
-        # Stay inside the camera cone (about 30 deg) so the target remains visible.
-        if float(np.dot(z_des, u_los)) < self._camera_cone_cos:
-            z_des = 0.65 * u_los + 0.35 * z_des
-            z_des = z_des / float(np.linalg.norm(z_des))
+        # Project the thrust/nose direction exactly onto the edge of the camera
+        # cone when gravity compensation would rotate the target out of view.
+        los_cos = float(np.clip(np.dot(z_des, u_los), -1.0, 1.0))
+        if not self.gravity_compensation_priority and los_cos < self._camera_cone_cos:
+            lateral = z_des - los_cos * u_los
+            lateral_norm = float(np.linalg.norm(lateral))
+            if lateral_norm > 1e-9:
+                lateral /= lateral_norm
+                cone_sin = np.sqrt(max(0.0, 1.0 - self._camera_cone_cos**2))
+                z_des = self._camera_cone_cos * u_los + cone_sin * lateral
+            else:
+                z_des = u_los.copy()
         if z_des[2] < 0.2:
             z_des = z_des.copy()
             z_des[2] = 0.2
             z_des = z_des / float(np.linalg.norm(z_des))
 
         u_1 = self.m * float(np.dot(specific, z_des))
+        if self.altitude_thrust_priority and z_des[2] > 0.1:
+            # With the nose constrained near a low-elevation target, increase
+            # thrust enough for its vertical component to balance gravity.
+            u_1 = max(u_1, self.m * self.g / float(z_des[2]))
         u_1 = float(np.clip(u_1, 0.45 * self.m * self.g, 2.8 * self.m * self.g))
 
         heading = float(np.arctan2(z_des[1], z_des[0]))
@@ -599,6 +742,7 @@ class PegasusApp:
             startup_delay=TARGET_MOTION_STARTUP_S,
             seed=TARGET_SEED,
             kind=TARGET_MOTION,
+            heading_deg=0.0 if HORIZONTAL_CHASE else None,
         )
         self.telemetry_path, self.summary_path = _diagnostic_paths(self.target_motion)
         self.telemetry = (
@@ -630,6 +774,16 @@ class PegasusApp:
             bearing_coast_time_s=BEARING_COAST_TIME_S,
             closing_floor_fraction=CLOSING_FLOOR_FRACTION,
             camera_cone_deg=CAMERA_CONE_DEG,
+            max_forward_accel_mps2=MAX_FORWARD_ACCEL_MPS2,
+            forward_speed_gain=1.0 if HORIZONTAL_CHASE else 2.2,
+            gravity_compensation_priority=False,
+            altitude_thrust_priority=HORIZONTAL_CHASE,
+            pn_los_anchor_tau_s=0.35 if HORIZONTAL_CHASE else 0.0,
+            pn_accel_feedforward=0.0 if HORIZONTAL_CHASE else 1.0,
+            # No horizontal launch shortcut: acquire through the upward camera
+            # while hovering, then transition into the chase.
+            launch_direction=None,
+            launch_acquisition_time_s=0.0,
             telemetry_interval_s=PN_TELEMETRY_INTERVAL_S,
             fov_deg=float(CAMERA_CONFIG["fov"]),
             cruise_height=float(PURSUER_SPAWN[2]),
@@ -779,9 +933,12 @@ class PegasusApp:
                 ),
                 "end_reason": end_reason,
                 "seed": TARGET_SEED,
+                "engagement": ENGAGEMENT,
                 "motion": self.target_motion.kind,
                 "motion_description": self.target_motion.describe(),
                 "guidance_mode": GUIDANCE_MODE,
+                "target_speed_mps": TARGET_SPEED,
+                "pursuer_speed_mps": PURSUER_SPEED,
                 "nav_constant": NAV_CONSTANT,
                 "max_lateral_accel_mps2": MAX_LATERAL_ACCEL_MPS2,
                 "max_turn_rate_rad_s": MAX_TURN_RATE_RAD_S,
